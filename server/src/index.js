@@ -9,7 +9,12 @@ import { promisify } from "node:util";
 import { nanoid } from "nanoid";
 import { z } from "zod";
 import { createContractDocx } from "./contractDocument.js";
-import { isDeepSeekConfigured, sanitizeContractFieldsWithDeepSeek } from "./deepseekSanitizer.js";
+import {
+  extractContractFieldsFromTranscript,
+  isDeepSeekConfigured,
+  sanitizeContractFieldsWithDeepSeek,
+} from "./deepseekSanitizer.js";
+import { isAliyunSpeechConfigured, transcribeCantoneseAudio } from "./speechService.js";
 
 const execFileAsync = promisify(execFile);
 const __filename = fileURLToPath(import.meta.url);
@@ -31,6 +36,12 @@ const contractSchema = z.object({
   totalPrice: z.string().trim().min(1, "总价为必填项").max(80),
   deliveryTime: z.string().trim().min(1, "交货时间为必填项").max(120),
   deliveryPlace: z.string().trim().min(1, "交货地点为必填项").max(160),
+});
+
+const speechSchema = z.object({
+  audioBase64: z.string().min(1, "请上传音频"),
+  mimeType: z.string().max(100).optional(),
+  sampleRate: z.number().int().positive().optional(),
 });
 
 let sofficePathCache;
@@ -122,7 +133,7 @@ function sendMissing(res, type) {
 }
 
 app.use(cors());
-app.use(express.json({ limit: "128kb" }));
+app.use(express.json({ limit: "14mb" }));
 
 app.get("/api/health", async (_req, res) => {
   const soffice = await findSoffice();
@@ -131,7 +142,46 @@ app.get("/api/health", async (_req, res) => {
     libreOffice: Boolean(soffice),
     sofficePath: soffice,
     deepSeekConfigured: isDeepSeekConfigured(),
+    aliyunSpeechConfigured: isAliyunSpeechConfigured(),
   });
+});
+
+app.post("/api/speech/cantonese", async (req, res, next) => {
+  const result = speechSchema.safeParse(req.body);
+  if (!result.success) {
+    return res.status(400).json({
+      error: "语音请求不完整",
+      details: result.error.issues.map((issue) => ({
+        path: issue.path.join("."),
+        message: issue.message,
+      })),
+    });
+  }
+
+  try {
+    const transcription = await transcribeCantoneseAudio(result.data);
+    const extraction = await extractContractFieldsFromTranscript(transcription.text);
+
+    if (!extraction.approved) {
+      return res.status(422).json({
+        error: extraction.reason || "语音内容不适合生成合同，请重新录入",
+        code: "VOICE_INPUT_REJECTED",
+        text: transcription.text,
+        fields: extraction.fields,
+      });
+    }
+
+    return res.json({
+      text: transcription.text,
+      taskId: transcription.taskId,
+      provider: transcription.provider,
+      fields: extraction.fields,
+      missingFields: extraction.missingFields,
+      parsedBy: extraction.source,
+    });
+  } catch (error) {
+    return next(error);
+  }
 });
 
 app.post("/api/contracts", async (req, res, next) => {
